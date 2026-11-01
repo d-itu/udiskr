@@ -21,7 +21,8 @@ const MAX_MOUNT_RETRIES: u32 = 3;
 type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedVariant>>>;
 
 /// Boxed future for a mount operation, so all mount futures share one concrete type.
-type MountFuture = Pin<Box<dyn std::future::Future<Output = (OwnedObjectPath, Result<MountResult, zbus::Error>)>>>;
+type MountFuture =
+    Pin<Box<dyn std::future::Future<Output = (OwnedObjectPath, Result<MountResult, zbus::Error>)>>>;
 
 /// A mounted device we are tracking.
 #[derive(Clone, Debug)]
@@ -170,7 +171,7 @@ async fn notify_unmounted(n: &NotificationsProxy<'_>, device: &MountedDevice) ->
 
 fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
+        .enable_all()
         .build()
         .expect("failed to build runtime");
     if let Err(e) = rt.block_on(run()) {
@@ -416,7 +417,7 @@ async fn try_mount(
         let fs = FilesystemProxy::new(&system, &object_path).await?;
         let points = fs.mount_points().await?;
         if let Some(mp) = first_mount_point(&points) {
-            return Ok(MountResult::AlreadyMounted(mp));
+            return Ok(MountResult::AlreadyMounted(mp.to_string()));
         }
         fs.mount(&HashMap::new()).await.map(MountResult::Mounted)
     }
@@ -425,10 +426,13 @@ async fn try_mount(
 }
 
 /// UDisks2 mount points are NUL-terminated byte strings (`aay`).
-fn first_mount_point(points: &[Vec<u8>]) -> Option<String> {
+///
+/// Returns a borrowed `&str` with no allocation. Invalid UTF-8 yields `None`
+/// (the caller decides whether to fall back to lossy conversion).
+fn first_mount_point(points: &[Vec<u8>]) -> Option<&str> {
     let bytes = points.first()?;
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    std::str::from_utf8(&bytes[..end]).ok()
 }
 
 /// "/org/.../block_devices/sdb1" -> "sdb1" (never panics).
