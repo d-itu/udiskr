@@ -7,6 +7,7 @@ use std::{
     path::Path,
     pin::Pin,
     process::{Command, Stdio},
+    sync::OnceLock,
     time::Duration,
 };
 use zbus::{Connection, OwnedObjectPath, OwnedVariant, Variant, proxy};
@@ -59,10 +60,20 @@ enum Step {
     MountDone(OwnedObjectPath, zbus::Result<MountResult>),
 }
 
-/// Log only when UDISKR_DEBUG is set. Does not allocate when disabled.
+/// Whether debug logging is enabled (set via --debug flag).
+static DEBUG: OnceLock<bool> = OnceLock::new();
+
+fn debug_enabled() -> bool {
+    *DEBUG.get_or_init(|| {
+        std::env::var_os("UDISKR_DEBUG").is_some()
+            || std::env::args().any(|a| a == "--debug" || a == "-d")
+    })
+}
+
+/// Log only when --debug is passed. Does not allocate when disabled.
 macro_rules! debug {
     ($($arg:tt)*) => {
-        if std::env::var_os("UDISKR_DEBUG").is_some() {
+        if debug_enabled() {
             eprintln!("udiskr: {}", format_args!($($arg)*));
         }
     };

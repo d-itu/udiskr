@@ -8,6 +8,7 @@ pkgdesc="Lightweight UDisks2 wrapper for automatic device mounting"
 arch=('x86_64' 'aarch64' 'armv7h' 'i686')
 url="https://github.com/sontungexpt/udiskr"
 license=('MIT')
+options=(!debug)
 
 depends=('udisks2' 'dbus')
 makedepends=('cargo' 'git')
