@@ -1,31 +1,27 @@
+use futures::{
+    StreamExt as _, select,
+    stream::{FuturesUnordered, select_all},
+};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    pin::Pin,
     process::{Command, Stdio},
+    time::Duration,
 };
-
-use futures::{
-    StreamExt as _,
-    select,
-    stream::{FuturesUnordered, select_all},
-};
-use zbus::{
-    Connection,
-    OwnedObjectPath,
-    OwnedVariant,
-    Variant,
-    proxy,
-};
+use zbus::{Connection, OwnedObjectPath, OwnedVariant, Variant, proxy};
 
 const PREFIX: &str = "/org/freedesktop/UDisks2/block_devices/";
 const FS_IFACE: &str = "org.freedesktop.UDisks2.Filesystem";
 const MOUNT_TIMEOUT_MS: i32 = 30_000;
 const REMOVED_TIMEOUT_MS: i32 = 6_000;
+const MOUNT_RETRY_DELAY_MS: u64 = 5_000;
+const MAX_MOUNT_RETRIES: u32 = 3;
 
 type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedVariant>>>;
 
-/// Why a device was skipped during mount (debug only).
-type SkipReason = &'static str;
+/// Boxed future for a mount operation, so all mount futures share one concrete type.
+type MountFuture = Pin<Box<dyn std::future::Future<Output = (OwnedObjectPath, Result<MountResult, zbus::Error>)>>>;
 
 /// A mounted device we are tracking.
 #[derive(Clone, Debug)]
@@ -35,22 +31,18 @@ struct MountedDevice {
     notification_id: u32,
 }
 
-/// What the main loop woke up for.
-enum Step {
-    Event(Option<Ev>),
-    MountDone(OwnedObjectPath, zbus::Result<MountResult>),
+/// Tracks mount retry state for a device.
+#[derive(Clone, Debug, Default)]
+struct MountRetry {
+    attempts: u32,
 }
 
-/// Result of a mount attempt.
+/// Result of mounting a device.
 #[derive(Debug)]
 enum MountResult {
-    /// We mounted it, at this path.
     Mounted(String),
-    /// Someone else already mounted it. We track it silently so we can still
-    /// report its removal.
     AlreadyMounted(String),
-    /// Deliberately skipped with a reason.
-    Skipped(SkipReason),
+    Skipped(&'static str),
 }
 
 /// Events from all three D-Bus sources, merged into one stream.
@@ -58,6 +50,12 @@ enum Ev {
     Added(OwnedObjectPath),
     Removed(OwnedObjectPath),
     Clicked(u32),
+}
+
+/// What the main loop woke up for.
+enum Step {
+    Event(Option<Ev>),
+    MountDone(OwnedObjectPath, zbus::Result<MountResult>),
 }
 
 /// Log only when UDISKR_DEBUG is set. Does not allocate when disabled.
@@ -77,37 +75,35 @@ fn is_wayland() -> bool {
 
 /// Open the mount point with `xdg-open`, falling back to `gio open`
 /// (order flipped on Wayland).
-///
-/// Runs in a helper thread: the thread waits for the opener, so no zombies pile
-/// up, and the fallback also triggers when the first opener exists but fails
-/// (not only when its binary is missing).
 fn open_file_manager(dir: String) {
+    let wayland = is_wayland();
+
     std::thread::spawn(move || {
-        let mut openers = [("xdg-open", None), ("gio", Some("open"))];
-        if is_wayland() {
-            openers.reverse();
-        }
-        for (bin, sub) in openers {
-            let status = Command::new(bin)
-                .args(sub)
+        let openers: &[(&str, &[&str])] = if wayland {
+            &[("gio", &["open"]), ("xdg-open", &[])]
+        } else {
+            &[("xdg-open", &[]), ("gio", &["open"])]
+        };
+
+        for (bin, args) in openers {
+            match Command::new(bin)
+                .args(*args)
                 .arg(&dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
-            match status {
-                Ok(s) if s.success() => return,
-                Ok(s) => debug!("{bin} exited with {s}"),
+                .spawn()
+            {
+                Ok(_) => return,
                 Err(e) => debug!("{bin}: {e}"),
             }
         }
+
         eprintln!("udiskr: could not open {dir}");
     });
 }
 
-/// Send/replace a notification.
-/// `replaces` must be 0 (new notification) or an id previously returned by the server.
-/// Returns the server-assigned id, or 0 if the call failed.
+/// Send/replace a notification. Returns the server-assigned id, or 0 if it failed.
 async fn send_notification(
     n: &NotificationsProxy<'_>,
     summary: &str,
@@ -133,13 +129,50 @@ async fn send_notification(
     })
 }
 
+/// Send a "mounted" notification. Returns the server-assigned id.
+async fn notify_mounted(
+    n: &NotificationsProxy<'_>,
+    path: &OwnedObjectPath,
+    mount_point: &str,
+) -> u32 {
+    let msg = format!("Mounted /dev/{} at {mount_point}", dev(path));
+    eprintln!("{msg}");
+    send_notification(
+        n,
+        "block device mounted",
+        &msg,
+        &["default", "open"],
+        0,
+        MOUNT_TIMEOUT_MS,
+    )
+    .await
+}
+
+/// Send an "unmounted" notification. Returns the server-assigned id.
+async fn notify_unmounted(n: &NotificationsProxy<'_>, device: &MountedDevice) -> u32 {
+    let msg = format!(
+        "/dev/{} unmounted from {}",
+        dev(&device.object_path),
+        device.mount_point
+    );
+    eprintln!("{msg}");
+    let replaces = device.notification_id;
+    send_notification(
+        n,
+        "block device unmounted",
+        &msg,
+        &[],
+        replaces,
+        REMOVED_TIMEOUT_MS,
+    )
+    .await
+}
+
 fn main() {
-    // No timers are used, so only the I/O driver is needed.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .expect("failed to build runtime");
-    // Exit non-zero on any fatal error so a supervisor (systemd etc.) can restart us.
     if let Err(e) = rt.block_on(run()) {
         eprintln!("udiskr: {e}");
         std::process::exit(1);
@@ -148,14 +181,18 @@ fn main() {
 
 async fn run() -> zbus::Result<()> {
     let system = Connection::system().await?;
-    PeerProxy::new(
-        &system,
-        "org.freedesktop.UDisks2",
-        "/org/freedesktop/UDisks2/Manager",
-    )
-    .await?
-    .ping()
-    .await?;
+    // Ping the udisksd manager to verify it's reachable. Non-fatal if it fails.
+    let _ = (async {
+        PeerProxy::new(
+            &system,
+            "org.freedesktop.UDisks2",
+            "/org/freedesktop/UDisks2/Manager",
+        )
+        .await?
+        .ping()
+        .await
+    })
+    .await;
 
     let manager = ManagerProxy::new(&system).await?;
 
@@ -191,12 +228,10 @@ async fn run() -> zbus::Result<()> {
     let mut events = select_all([added, removed, clicked]);
 
     let mut mounted: HashMap<OwnedObjectPath, MountedDevice> = HashMap::new();
-    let mut next_notify_id: u32 = 1;
-    // Mounts currently in flight.
     let mut busy: HashSet<OwnedObjectPath> = HashSet::new();
-    // In-flight mounts whose device was removed meanwhile: their result is discarded.
     let mut gone: HashSet<OwnedObjectPath> = HashSet::new();
-    let mut pending = FuturesUnordered::new();
+    let mut mount_retries: HashMap<OwnedObjectPath, MountRetry> = HashMap::new();
+    let mut pending = FuturesUnordered::<MountFuture>::new();
 
     // Startup scan: queue devices that were already plugged in.
     match manager.get_managed_objects().await {
@@ -206,11 +241,30 @@ async fn run() -> zbus::Result<()> {
                     && ifaces.contains_key(FS_IFACE)
                     && busy.insert(path.clone())
                 {
-                    pending.push(try_mount(system.clone(), path));
+                    pending.push(Box::pin(try_mount(system.clone(), path)));
                 }
             }
         }
-        Err(e) => eprintln!("udiskr: initial device scan failed: {e}"),
+        Err(e) => {
+            eprintln!("udiskr: initial device scan failed: {e}, retrying in 5s...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            match manager.get_managed_objects().await {
+                Ok(objects) => {
+                    for (path, ifaces) in objects {
+                        if path.as_str().starts_with(PREFIX)
+                            && ifaces.contains_key(FS_IFACE)
+                            && busy.insert(path.clone())
+                        {
+                            pending.push(Box::pin(try_mount(system.clone(), path)));
+                        }
+                    }
+                }
+                Err(e2) => {
+                    eprintln!("udiskr: initial device scan failed again: {e2}");
+                    return Err(e2);
+                }
+            }
+        }
     }
 
     loop {
@@ -229,12 +283,11 @@ async fn run() -> zbus::Result<()> {
                     continue;
                 }
                 if busy.contains(&path) {
-                    // Removed and re-added while a mount was in flight:
-                    // the device is back, so keep the in-flight result.
                     gone.remove(&path);
                 } else {
                     busy.insert(path.clone());
-                    pending.push(try_mount(system.clone(), path));
+                    mount_retries.insert(path.clone(), MountRetry::default());
+                    pending.push(Box::pin(try_mount(system.clone(), path)));
                 }
             }
             Step::Event(Some(Ev::Removed(path))) => {
@@ -242,39 +295,25 @@ async fn run() -> zbus::Result<()> {
                     gone.insert(path.clone());
                 }
                 if let Some(device) = mounted.remove(&path) {
-                    let msg = format!(
-                        "/dev/{} unmounted from {}",
-                        dev(&device.object_path),
-                        device.mount_point
-                    );
-                    eprintln!("{msg}");
-                    // Reuse the server-assigned id so this REPLACES the "mounted"
-                    // notification (and drops its actions). With id 0 a new
-                    // notification is created instead. Pass 0 here to keep both.
-                    let replaces = if device.notification_id != 0 {
-                        device.notification_id
-                    } else {
-                        0
-                    };
-                    let _ = send_notification(
-                        &notifier,
-                        "block device unmounted",
-                        &msg,
-                        &[],
-                        replaces,
-                        REMOVED_TIMEOUT_MS,
-                    )
-                    .await;
+                    let _ = notify_unmounted(&notifier, &device).await;
                 }
+                mount_retries.remove(&path);
             }
             Step::Event(Some(Ev::Clicked(id))) => {
                 debug!("clicked notification {id}");
                 if id != 0 {
-                    if let Some((_, device)) = mounted.iter().find(|(_, d)| d.notification_id == id) {
-                        if Path::new(&device.mount_point).is_dir() {
-                            open_file_manager(device.mount_point.clone());
-                        } else {
-                            debug!("mount point {} no longer exists", device.mount_point);
+                    let stale_path: Option<OwnedObjectPath> = mounted
+                        .iter()
+                        .find(|(_, d)| d.notification_id == id)
+                        .map(|(path, _)| path.clone());
+                    if let Some(path) = stale_path {
+                        if let Some(device) = mounted.get(&path) {
+                            if Path::new(&device.mount_point).is_dir() {
+                                open_file_manager(device.mount_point.clone());
+                            } else {
+                                debug!("mount point {} no longer exists", device.mount_point);
+                                mounted.remove(&path);
+                            }
                         }
                     } else {
                         debug!("no mounted device for notification id {id}");
@@ -285,25 +324,13 @@ async fn run() -> zbus::Result<()> {
                 busy.remove(&path);
                 if gone.remove(&path) {
                     debug!("{} vanished while mounting", dev(&path));
+                    mount_retries.remove(&path);
                     continue;
                 }
                 match res {
                     Ok(MountResult::Mounted(mount_point)) => {
-                        let msg = format!("Mounted /dev/{} at {mount_point}", dev(&path));
-                        eprintln!("{msg}");
-                        // Action keys come in (key, label) pairs. "default" is the
-                        // body click on most servers; the second pair gives a button
-                        // on servers that don't render "default".
-                        let id = send_notification(
-                            &notifier,
-                            "block device mounted",
-                            &msg,
-                            &["default", "Open", "open", "Open"],
-                            next_notify_id,
-                            MOUNT_TIMEOUT_MS,
-                        )
-                        .await;
-                        next_notify_id = next_notify_id.wrapping_add(1);
+                        let id = notify_mounted(&notifier, &path, &mount_point).await;
+                        mount_retries.remove(&path);
                         mounted.insert(
                             path.clone(),
                             MountedDevice {
@@ -315,6 +342,7 @@ async fn run() -> zbus::Result<()> {
                     }
                     Ok(MountResult::AlreadyMounted(mount_point)) => {
                         debug!("{} already mounted at {}", dev(&path), mount_point);
+                        mount_retries.remove(&path);
                         mounted.insert(
                             path.clone(),
                             MountedDevice {
@@ -326,28 +354,57 @@ async fn run() -> zbus::Result<()> {
                     }
                     Ok(MountResult::Skipped(reason)) => {
                         debug!("skipped {}: {reason}", dev(&path));
+                        mount_retries.remove(&path);
                     }
-                    // Ordinary D-Bus noise (e.g. device not ready), or someone else
-                    // mounted it first: ignore.
                     Err(zbus::Error::MethodError(name, _, _))
-                        if name.starts_with("org.freedesktop.DBus")
-                            || name.starts_with("org.freedesktop.UDisks2.Error.AlreadyMounted") =>
+                        if name.starts_with("org.freedesktop.UDisks2.Error.AlreadyMounted") =>
                     {
                         debug!("mount {}: {name}", dev(&path));
+                        mount_retries.remove(&path);
                     }
-                    Err(e) => eprintln!("udiskr: mount {}: {e}", dev(&path)),
+                    Err(e) => {
+                        let retries = mount_retries.entry(path.clone()).or_default();
+                        if retries.attempts < MAX_MOUNT_RETRIES {
+                            retries.attempts += 1;
+                            eprintln!(
+                                "udiskr: mount {} failed ({e}), retry {}/{}",
+                                dev(&path),
+                                retries.attempts,
+                                MAX_MOUNT_RETRIES
+                            );
+                            let path_clone = path.clone();
+                            let sys_clone = system.clone();
+                            pending.push(Box::pin(try_mount_retry(sys_clone, path_clone)));
+                        } else {
+                            eprintln!(
+                                "udiskr: mount {} failed after {} retries: {e}",
+                                dev(&path),
+                                MAX_MOUNT_RETRIES
+                            );
+                            mount_retries.remove(&path);
+                        }
+                    }
                 }
             }
         }
     }
-    Err(zbus::Error::Failure("D-Bus event stream ended".into()))
+    Ok(())
 }
 
-/// Mount one device. Returns `Ok(MountResult::Skipped(reason))` for deliberate skips.
+/// Mount one device with a retry delay. Used for transient mount failures.
+async fn try_mount_retry(
+    system: Connection,
+    object_path: OwnedObjectPath,
+) -> (OwnedObjectPath, Result<MountResult, zbus::Error>) {
+    tokio::time::sleep(Duration::from_millis(MOUNT_RETRY_DELAY_MS)).await;
+    try_mount(system, object_path).await
+}
+
+/// Mount one device. Returns `Ok(mount_point)` or `Ok(Skipped(reason))`.
 async fn try_mount(
     system: Connection,
     object_path: OwnedObjectPath,
-) -> (OwnedObjectPath, zbus::Result<MountResult>) {
+) -> (OwnedObjectPath, Result<MountResult, zbus::Error>) {
     let res = async {
         let block = BlockProxy::new(&system, &object_path).await?;
         if block.hint_ignore().await? {
@@ -376,7 +433,10 @@ fn first_mount_point(points: &[Vec<u8>]) -> Option<String> {
 
 /// "/org/.../block_devices/sdb1" -> "sdb1" (never panics).
 fn dev(object_path: &OwnedObjectPath) -> &str {
-    object_path.as_str().strip_prefix(PREFIX).unwrap_or(object_path.as_str())
+    object_path
+        .as_str()
+        .strip_prefix(PREFIX)
+        .unwrap_or(object_path.as_str())
 }
 
 #[proxy(

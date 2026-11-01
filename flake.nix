@@ -1,39 +1,32 @@
+
 {
   description = "Lightweight alternative to udiskie";
+
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
-  outputs = {
-    self,
-    nixpkgs,
-    rust-overlay,
-  }: let
-    supportedSystems = ["x86_64-linux"];
-    forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
-    pkgsFor = nixpkgs.legacyPackages;
 
-    udiskr-package = {pkgs ? import <nixpkgs> {}}: let
-      rust-overlay-pkgs = pkgs.extend rust-overlay.overlays.default;
+  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
+        rust = pkgs.rust-bin.stable.latest.default;
+      in
+      {
+        packages.default = pkgs.rustPlatform.buildRustPackage {
+          pname = "udiskr";
+          version = "0.2.0";
+          src = self;
 
-      rustPlatform = pkgs.makeRustPlatform {
-        cargo = rust-overlay-pkgs.rust-bin.nightly.latest.minimal;
-        rustc = rust-overlay-pkgs.rust-bin.nightly.latest.minimal;
-      };
-      manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
-    in
-      rustPlatform.buildRustPackage {
-        pname = manifest.name;
-        version = manifest.version;
-        cargoLock.lockFile = ./Cargo.lock;
-        src = pkgs.lib.cleanSource ./.;
-      };
-  in {
-    packages = forAllSystems (system: {
-      default = pkgsFor.${system}.callPackage udiskr-package {};
-    });
-  };
+          nativeBuildInputs = [ rust ];
+
+          cargoLock.lockFile = ./Cargo.lock;
+
+          doCheck = false;
+        };
+      }
+    );
 }

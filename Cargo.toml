@@ -6,7 +6,7 @@ rust-version = "1.99.0"
 
 [dependencies]
 futures = { version = "0.3", features = ["std"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "signal"] }
 zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
 
 [profile.release]
