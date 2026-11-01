@@ -91,27 +91,27 @@ fn open_file_manager(dir: String) {
     let wayland = is_wayland();
 
     std::thread::spawn(move || {
-        let openers: &[(&str, &[&str])] = if wayland {
-            &[("gio", &["open"]), ("xdg-open", &[])]
-        } else {
-            &[("xdg-open", &[]), ("gio", &["open"])]
-        };
-
-        for (bin, args) in openers {
-            match Command::new(bin)
-                .args(*args)
+        let try_open = |bin: &str, args: &[&str]| -> bool {
+            Command::new(bin)
+                .args(args)
                 .arg(&dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(_) => return,
-                Err(e) => debug!("{bin}: {e}"),
-            }
-        }
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        };
 
-        eprintln!("udiskr: could not open {dir}");
+        let success = if wayland {
+            try_open("gio", &["open"]) || try_open("xdg-open", &[])
+        } else {
+            try_open("xdg-open", &[]) || try_open("gio", &["open"])
+        };
+
+        if !success {
+            eprintln!("udiskr: could not open {dir}");
+        }
     });
 }
 
