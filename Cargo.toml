@@ -1,16 +1,18 @@
 [package]
 name = "udiskr"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.99.0"
 
 [dependencies]
-futures = { version = "0.3.31", default-features = false, features = [] }
-rustc-hash = { version = "2.1.1", default-features = false, features = ["std"] }
-tokio = { version = "1.49.0", features = ["rt"] }
-zbus = { version = "5.7.0", default-features = false, features = ["tokio"] }
+futures = { version = "0.3", features = ["std"] }
+tokio = { version = "1", features = ["rt", "macros", "signal"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
 
 [profile.release]
+opt-level = 3
 lto = true
-panic = "abort"
 codegen-units = 1
+panic = "abort"
+split-debuginfo = "off"
+strip = true

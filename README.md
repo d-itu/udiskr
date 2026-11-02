@@ -6,9 +6,11 @@ which can be used as a lightweight alternative to [`udiskie`](https://github.com
 
 ## Install
 ```sh
-cargo +nightly install --git https://github.com/uriib/udiskr.git
+cargo install --git https://github.com/uriib/udiskr.git
 ```
 The compiled binary will be installed at `$HOME/.cargo/bin/udiskr` by default.
+
+Builds on **stable Rust** (no nightly required).
 
 ## Usage
 
@@ -23,7 +25,9 @@ exec-once = exec udiskr
 ### Available
 - Automatically start `udisksd` (daemon for `udisks2`)
 - Automated mounting of devices
-- Notifications
+- Automated unmounting when devices are unplugged
+- Desktop notifications (with click-to-open)
+- Wayland and X11 support for opening file manager
 - Minimal memory usage
 ### Planned
 - Encrypted device support
